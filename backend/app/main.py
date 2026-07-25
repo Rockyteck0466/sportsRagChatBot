@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .chunker import chunk_pages
 from .config import settings
 from .database import Database
+from .question_index import build_expected_question_index
 from .rag import RagService
 from .retrieval import HybridRetriever
 from .schemas import ChatRequest, ChatResponse, IngestRequest, IngestResponse
@@ -13,7 +14,7 @@ from .scraper import NbaScraper
 from .security import UnsafeUrl
 from .vector_store import VectorStore, VectorStoreUnavailable
 
-app = FastAPI(title="Courtside RAG API", version="1.0.0")
+app = FastAPI(title="SIA RAG API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:5173"],
@@ -42,6 +43,10 @@ def status() -> dict:
         "markdown_files": markdown_files,
         "source_host": "www.nba.com",
         "chat_scrapes_live": False,
+        "answer_provider": "OpenAI API",
+        "answer_model": settings.openai_model,
+        "query_model": settings.openai_query_model or settings.openai_model,
+        "query_planner_enabled": settings.enable_query_planner,
     }
 
 
@@ -62,8 +67,23 @@ async def ingest(payload: IngestRequest) -> IngestResponse:
     except VectorStoreUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     database.replace_corpus(pages, chunks)
+    expected_questions = 0
+    try:
+        question_result = await build_expected_question_index(
+            database,
+            vector_store,
+            settings,
+        )
+        expected_questions = question_result["questions"]
+    except Exception as exc:
+        errors.append(f"Expected-question index: {type(exc).__name__}")
     database.record_run(str(payload.seed_url), started_at, len(pages), len(chunks), errors)
-    return IngestResponse(pages_indexed=len(pages), chunks_created=len(chunks), skipped=len(errors))
+    return IngestResponse(
+        pages_indexed=len(pages),
+        chunks_created=len(chunks),
+        skipped=len(errors),
+        expected_questions=expected_questions,
+    )
 
 
 @app.post("/api/chat", response_model=ChatResponse)

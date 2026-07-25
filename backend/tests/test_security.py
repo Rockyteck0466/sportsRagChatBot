@@ -20,3 +20,10 @@ def test_accepts_approved_public_host(monkeypatch: pytest.MonkeyPatch) -> None:
     assert normalize_approved_url(
         "https://www.nba.com/standings#ignored", frozenset({"www.nba.com"})
     ) == "https://www.nba.com/standings"
+
+
+def test_accepts_official_nba_subdomain(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: [(2, 1, 6, "", ("151.101.1.55", 443))])
+    assert normalize_approved_url(
+        "https://official.nba.com/rule-no-3/", frozenset({"official.nba.com"})
+    ) == "https://official.nba.com/rule-no-3/"

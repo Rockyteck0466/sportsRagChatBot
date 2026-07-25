@@ -118,7 +118,7 @@ export default function Home() {
           <section className="questionSection">
             <div className="sectionHeading">
               <span>02</span>
-              <h2>Ask a question</h2>
+              <h2>Question</h2>
             </div>
 
             <form onSubmit={ask}>

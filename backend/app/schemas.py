@@ -10,6 +10,7 @@ class IngestResponse(BaseModel):
     pages_indexed: int
     chunks_created: int
     skipped: int
+    expected_questions: int = 0
 
 
 class ChatRequest(BaseModel):

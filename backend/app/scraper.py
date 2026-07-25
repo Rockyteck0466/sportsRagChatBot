@@ -9,6 +9,7 @@ from urllib.robotparser import RobotFileParser
 import httpx
 
 from .config import Settings
+from .content_cleaner import clean_markdown
 from .security import UnsafeUrl, normalize_approved_url
 
 SUSPICIOUS = re.compile(
@@ -18,6 +19,8 @@ SUSPICIOUS = re.compile(
 )
 MARKDOWN_LINK = re.compile(r"\[[^\]]*]\((https?://[^)\s]+|/[^)\s]+)\)")
 BALANCED_SEEDS = (
+    "https://official.nba.com/rule-no-3-players-substitutes-and-coaches/",
+    "https://www.nba.com/news/about",
     "https://www.nba.com/teams",
     "https://www.nba.com/players",
     "https://www.nba.com/standings",
@@ -29,7 +32,7 @@ BALANCED_SEEDS = (
     "https://www.nba.com/",
 )
 PRIORITY_PATHS = (
-    "/teams", "/team/", "/players", "/player/", "/standings", "/schedule",
+    "/rule-no-", "/rulebook", "/teams", "/team/", "/players", "/player/", "/standings", "/schedule",
     "/stats/help/", "/stats/history", "/history", "/news",
 )
 
@@ -67,7 +70,7 @@ class NbaScraper:
         response.raise_for_status()
         if len(response.content) > self.config.crawl_max_bytes:
             raise ValueError("Markdown response exceeded the size limit.")
-        return response.text
+        return response.content.decode("utf-8", errors="replace")
 
     @staticmethod
     def _link_priority(url: str) -> tuple[int, str]:
@@ -90,8 +93,21 @@ class NbaScraper:
 
     @staticmethod
     def _title(markdown: str, fallback: str) -> str:
-        heading = re.search(r"^\s*#\s+(.+?)\s*$", markdown, re.MULTILINE)
+        heading = re.search(r"^\s*#\s+(.+?)\s*$", clean_markdown(markdown), re.MULTILINE)
         return (heading.group(1) if heading else fallback)[:300]
+
+    def _page(self, url: str, markdown: str) -> dict:
+        if len(markdown) < 100:
+            raise ValueError("Markdown response contained too little useful content.")
+        if SUSPICIOUS.search(markdown):
+            raise ValueError("Prompt-injection-like content was quarantined.")
+        return {
+            "url": url,
+            "title": self._title(markdown, url),
+            "retrieved_at": datetime.now(UTC).isoformat(),
+            "content_hash": hashlib.sha256(markdown.encode()).hexdigest(),
+            "text": markdown,
+        }
 
     def persist_markdown(self, pages: list[dict]) -> None:
         directory = self.config.markdown_dir
@@ -110,6 +126,20 @@ class NbaScraper:
             )
             target.write_text(frontmatter + page["text"], encoding="utf-8")
 
+    async def fetch_page(self, target_url: str) -> dict:
+        """Fetch and persist one approved page for incremental ingestion."""
+        target = normalize_approved_url(target_url, self.config.allowed_hosts)
+        headers = {"User-Agent": self.config.crawler_user_agent}
+        timeout = httpx.Timeout(max(70, self.config.crawl_timeout_seconds))
+        async with httpx.AsyncClient(headers=headers, timeout=timeout, follow_redirects=False) as client:
+            robots = await self._robots(client, target)
+            if not robots.can_fetch(self.config.crawler_user_agent, target):
+                raise ValueError(f"robots.txt denied {target}")
+            markdown = (await self._download_markdown(client, target)).strip()
+        page = self._page(target, markdown)
+        self.persist_markdown([page])
+        return page
+
     async def crawl(self, seed_url: str, max_pages: int) -> tuple[list[dict], list[str]]:
         normalize_approved_url(seed_url, self.config.allowed_hosts)
         headers = {"User-Agent": self.config.crawler_user_agent}
@@ -120,29 +150,22 @@ class NbaScraper:
         seen: set[str] = set()
 
         async with httpx.AsyncClient(headers=headers, timeout=timeout, follow_redirects=False) as client:
-            robots = await self._robots(client, seed_url)
+            robots_by_origin: dict[str, RobotFileParser] = {}
             while queue and len(pages) < max_pages:
                 candidate = queue.pop(0)
                 if candidate in seen:
                     continue
                 seen.add(candidate)
-                if not robots.can_fetch(self.config.crawler_user_agent, candidate):
+                parsed_candidate = urlparse(candidate)
+                origin = f"{parsed_candidate.scheme}://{parsed_candidate.netloc}"
+                if origin not in robots_by_origin:
+                    robots_by_origin[origin] = await self._robots(client, candidate)
+                if not robots_by_origin[origin].can_fetch(self.config.crawler_user_agent, candidate):
                     errors.append(f"robots.txt denied {candidate}")
                     continue
                 try:
                     markdown = (await self._download_markdown(client, candidate)).strip()
-                    if len(markdown) < 100:
-                        raise ValueError("Markdown response contained too little useful content.")
-                    if SUSPICIOUS.search(markdown):
-                        raise ValueError("Prompt-injection-like content was quarantined.")
-                    retrieved_at = datetime.now(UTC).isoformat()
-                    pages.append({
-                        "url": candidate,
-                        "title": self._title(markdown, candidate),
-                        "retrieved_at": retrieved_at,
-                        "content_hash": hashlib.sha256(markdown.encode()).hexdigest(),
-                        "text": markdown,
-                    })
+                    pages.append(self._page(candidate, markdown))
                     discovered = self._links(candidate, markdown)
                     queue.extend(link for link in discovered if link not in seen and link not in queue)
                     queue.sort(key=self._link_priority)

@@ -20,7 +20,7 @@ test("server-renders the simplified SIA application shell", async () => {
   assert.match(html, /<title>SIA/);
   assert.match(html, /Sports Interactive Agent/);
   assert.match(html, /References/);
-  assert.match(html, /Ask a question/);
+  assert.match(html, /Question/);
   assert.match(html, /Response/);
   assert.doesNotMatch(html, /Rebuild vector snapshot|Build Markdown index/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/);
