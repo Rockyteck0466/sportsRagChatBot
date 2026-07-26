@@ -1,3 +1,5 @@
+import asyncio
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 from fastapi import FastAPI, HTTPException
@@ -14,19 +16,39 @@ from .scraper import NbaScraper
 from .security import UnsafeUrl
 from .vector_store import VectorStore, VectorStoreUnavailable
 
-app = FastAPI(title="SIA RAG API", version="1.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:5173"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
-)
 database = Database(settings.data_dir / "courtside.sqlite")
 scraper = NbaScraper(settings)
 vector_store = VectorStore(settings)
 retriever = HybridRetriever(vector_store, database, settings)
 rag = RagService(retriever, settings)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    try:
+        await asyncio.to_thread(vector_store.warm)
+    except VectorStoreUnavailable:
+        # Health/status endpoints must still explain an unbuilt local index.
+        pass
+    yield
+
+
+app = FastAPI(
+    title="SIA RAG API",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+    ],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
 
 
 @app.get("/health")

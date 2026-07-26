@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ class VectorStore:
         self._collection_name: str | None = None
         self._question_collection: Any = None
         self._question_collection_name: str | None = None
+        self._initialization_lock = threading.RLock()
 
     def _dependencies(self) -> tuple[Any, Any]:
         try:
@@ -35,37 +37,59 @@ class VectorStore:
 
     def _embedding_model(self) -> Any:
         if self._model is None:
-            _, sentence_transformer = self._dependencies()
-            self._model = sentence_transformer(self.config.embedding_model)
+            with self._initialization_lock:
+                if self._model is None:
+                    _, sentence_transformer = self._dependencies()
+                    try:
+                        # Normal chat should use the already-downloaded model
+                        # without a Hugging Face network check on every backend
+                        # restart. A first-time machine falls back to the normal
+                        # download path.
+                        self._model = sentence_transformer(
+                            self.config.embedding_model,
+                            local_files_only=True,
+                        )
+                    except (OSError, TypeError, ValueError):
+                        self._model = sentence_transformer(
+                            self.config.embedding_model
+                        )
         return self._model
 
     def _persistent_client(self) -> Any:
         if self._client is None:
-            chromadb, _ = self._dependencies()
-            self.config.chroma_dir.mkdir(parents=True, exist_ok=True)
-            self._client = chromadb.PersistentClient(path=str(self.config.chroma_dir))
+            with self._initialization_lock:
+                if self._client is None:
+                    chromadb, _ = self._dependencies()
+                    self.config.chroma_dir.mkdir(parents=True, exist_ok=True)
+                    self._client = chromadb.PersistentClient(
+                        path=str(self.config.chroma_dir)
+                    )
         return self._client
 
     def _active_collection(self) -> Any:
-        name = self._active_name()
-        if self._collection is None or self._collection_name != name:
-            self._collection = self._persistent_client().get_collection(name)
-            self._collection_name = name
+        with self._initialization_lock:
+            name = self._active_name()
+            if self._collection is None or self._collection_name != name:
+                self._collection = self._persistent_client().get_collection(name)
+                self._collection_name = name
         return self._collection
 
     def _active_question_collection(self) -> Any | None:
-        if not self.state_path.exists():
-            return None
-        state = json.loads(self.state_path.read_text(encoding="utf-8"))
-        name = state.get("question_collection")
-        if not name:
-            return None
-        if (
-            self._question_collection is None
-            or self._question_collection_name != name
-        ):
-            self._question_collection = self._persistent_client().get_collection(name)
-            self._question_collection_name = name
+        with self._initialization_lock:
+            if not self.state_path.exists():
+                return None
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            name = state.get("question_collection")
+            if not name:
+                return None
+            if (
+                self._question_collection is None
+                or self._question_collection_name != name
+            ):
+                self._question_collection = (
+                    self._persistent_client().get_collection(name)
+                )
+                self._question_collection_name = name
         return self._question_collection
 
     @staticmethod
@@ -80,6 +104,12 @@ class VectorStore:
         if not self.state_path.exists():
             raise VectorStoreUnavailable("No active Chroma index exists. Run ingestion first.")
         return json.loads(self.state_path.read_text(encoding="utf-8"))["collection"]
+
+    def warm(self) -> None:
+        """Load the active indexes and embedding model before serving chat."""
+        self._active_collection()
+        self._active_question_collection()
+        self._embedding_model()
 
     def build(self, chunks: list[dict[str, Any]]) -> str:
         if not chunks:
@@ -111,14 +141,15 @@ class VectorStore:
                     for item in batch
                 ],
             )
-        temporary = self.state_path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps({"collection": name, "chunks": len(chunks), "embedding_model": self.config.embedding_model}),
-            encoding="utf-8",
-        )
-        os.replace(temporary, self.state_path)
-        self._collection = collection
-        self._collection_name = name
+        with self._initialization_lock:
+            temporary = self.state_path.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps({"collection": name, "chunks": len(chunks), "embedding_model": self.config.embedding_model}),
+                encoding="utf-8",
+            )
+            os.replace(temporary, self.state_path)
+            self._collection = collection
+            self._collection_name = name
         return name
 
     def upsert(self, chunks: list[dict[str, Any]], delete_ids: list[str] | None = None) -> str:
@@ -150,20 +181,21 @@ class VectorStore:
                 for item in chunks
             ],
         )
-        temporary = self.state_path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(
-                {
-                    "collection": name,
-                    "chunks": collection.count(),
-                    "embedding_model": self.config.embedding_model,
-                }
-            ),
-            encoding="utf-8",
-        )
-        os.replace(temporary, self.state_path)
-        self._collection = collection
-        self._collection_name = name
+        with self._initialization_lock:
+            temporary = self.state_path.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps(
+                    {
+                        "collection": name,
+                        "chunks": collection.count(),
+                        "embedding_model": self.config.embedding_model,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.replace(temporary, self.state_path)
+            self._collection = collection
+            self._collection_name = name
         return name
 
     def build_question_index(self, records: list[dict[str, Any]]) -> str:
@@ -197,14 +229,15 @@ class VectorStore:
                     for record in batch
                 ],
             )
-        state = json.loads(self.state_path.read_text(encoding="utf-8"))
-        state["question_collection"] = name
-        state["question_records"] = len(records)
-        temporary = self.state_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(state), encoding="utf-8")
-        os.replace(temporary, self.state_path)
-        self._question_collection = collection
-        self._question_collection_name = name
+        with self._initialization_lock:
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            state["question_collection"] = name
+            state["question_records"] = len(records)
+            temporary = self.state_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(state), encoding="utf-8")
+            os.replace(temporary, self.state_path)
+            self._question_collection = collection
+            self._question_collection_name = name
         return name
 
     def search(self, query: str, limit: int) -> list[dict[str, Any]]:
@@ -252,6 +285,87 @@ class VectorStore:
                 })
             batches.append(items)
         return batches
+
+    def search_source_and_questions_many(
+        self,
+        queries: list[str],
+        source_limit: int,
+        question_limit: int,
+    ) -> tuple[
+        list[list[dict[str, Any]]],
+        list[list[dict[str, Any]]],
+    ]:
+        """Embed once, then query both source and prepared-question indexes."""
+        if not queries:
+            return [], []
+        embeddings = self._embedding_model().encode_query(
+            queries,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ).tolist()
+
+        source_result = self._active_collection().query(
+            query_embeddings=embeddings,
+            n_results=source_limit,
+            include=["documents", "metadatas", "distances"],
+        )
+        source_batches: list[list[dict[str, Any]]] = []
+        for ids, documents, metadatas, distances in zip(
+            source_result["ids"],
+            source_result["documents"],
+            source_result["metadatas"],
+            source_result["distances"],
+        ):
+            source_batches.append([
+                {
+                    "chunk_id": chunk_id,
+                    "text": document,
+                    "page_url": metadata["page_url"],
+                    "title": metadata["title"],
+                    "section": metadata["section"],
+                    "retrieved_at": metadata["retrieved_at"],
+                    "score": max(0.0, 1.0 - float(distance)),
+                }
+                for chunk_id, document, metadata, distance in zip(
+                    ids,
+                    documents,
+                    metadatas,
+                    distances,
+                )
+            ])
+
+        question_collection = self._active_question_collection()
+        if question_collection is None or question_collection.count() <= 0:
+            return source_batches, [[] for _ in queries]
+        question_count = question_collection.count()
+        question_result = question_collection.query(
+            query_embeddings=embeddings,
+            n_results=min(
+                question_limit * 3,
+                question_count,
+            ),
+            include=["metadatas", "distances"],
+        )
+        question_batches: list[list[dict[str, Any]]] = []
+        for ids, metadatas, distances in zip(
+            question_result["ids"],
+            question_result["metadatas"],
+            question_result["distances"],
+        ):
+            question_batches.append([
+                {
+                    "question_id": question_id,
+                    "chunk_id": metadata["chunk_id"],
+                    "kind": metadata["kind"],
+                    "score": max(0.0, 1.0 - float(distance)),
+                }
+                for question_id, metadata, distance in zip(
+                    ids,
+                    metadatas,
+                    distances,
+                )
+            ])
+        return source_batches, question_batches
 
     def search_questions_many(
         self,

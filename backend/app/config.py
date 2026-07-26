@@ -30,9 +30,13 @@ class Settings(BaseSettings):
     fusion_top_k: int = 12
     retrieval_top_k: int = 3
     multi_source_top_k: int = 8
+    composite_task_top_k: int = 5
+    max_composite_groups: int = 30
+    composite_retrieval_concurrency: int = 4
     min_retrieval_score: float = 0.25
     enable_query_planner: bool = True
     query_plan_min_score: float = 0.48
+    query_plan_cache_size: int = 128
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     enable_reranker: bool = False
@@ -44,6 +48,10 @@ class Settings(BaseSettings):
     openai_question_model: str = "gpt-5.6-luna"
     openai_reasoning_effort: str = "none"
     openai_max_output_tokens: int = 500
+    openai_composite_max_output_tokens: int = 4_000
+    openai_context_max_chars: int = 60_000
+    openai_context_chunks_per_task: int = 3
+    openai_query_timeout_seconds: float = 20
     openai_timeout_seconds: float = 90
     question_generation_batch_size: int = 6
     questions_per_chunk: int = 3

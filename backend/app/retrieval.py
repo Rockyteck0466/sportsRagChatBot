@@ -234,6 +234,47 @@ def _canonical_page(url: str) -> str:
     )
 
 
+def _team_path_id(url: str) -> str:
+    """Return the team id from direct or nested NBA team URLs."""
+    parsed = urlparse(url)
+    if (parsed.hostname or "").lower() not in {"nba.com", "www.nba.com"}:
+        return ""
+    match = re.match(
+        r"^/team/(?P<team_id>\d+)(?:/|$)",
+        parsed.path,
+        flags=re.IGNORECASE,
+    )
+    return match.group("team_id") if match else ""
+
+
+def _normalized_label(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+FACET_SECTION_ALIASES: dict[str, tuple[str, ...]] = {
+    "roster": ("roster", "players", "team roster"),
+    "captain": ("captain", "team captain", "captains"),
+    "team_list": ("teams", "nba teams", "team list"),
+}
+
+
+def _contains_named_captain_evidence(text: str) -> bool:
+    """Require an explicit person-to-captain relation, not a bare rule mention."""
+    visible = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    name = (
+        r"[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'’.-]+"
+        r"(?:\s+[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'’.-]+){1,4}"
+    )
+    patterns = (
+        rf"\b(?:team\s+)?(?:co-)?captains?\s*(?:is|are|:|-)\s*{name}\b",
+        rf"\b{name}\s+(?:is|was|serves?|served|has\s+been|was\s+named)"
+        rf"\s+(?:as\s+)?(?:the\s+)?(?:team\s+)?(?:co-)?captain\b",
+        rf"\bnamed\s+{name}\s+(?:as\s+)?(?:the\s+)?"
+        rf"(?:team\s+)?(?:co-)?captain\b",
+    )
+    return any(re.search(pattern, visible) for pattern in patterns)
+
+
 class HybridRetriever:
     """Retrieve through separate semantic/lexical lanes and fuse ranks."""
 
@@ -253,7 +294,14 @@ class HybridRetriever:
     @staticmethod
     def _content_key(item: dict[str, Any]) -> str:
         normalized = re.sub(r"\s+", " ", item["text"]).strip().lower()
-        return hashlib.sha256(normalized.encode()).hexdigest()
+        identity = "||".join(
+            (
+                _canonical_page(str(item.get("page_url", ""))),
+                _normalized_label(str(item.get("section", ""))),
+                normalized,
+            )
+        )
+        return hashlib.sha256(identity.encode()).hexdigest()
 
     @staticmethod
     def _evidence_window(
@@ -438,6 +486,995 @@ class HybridRetriever:
             if len(variants) >= 8:
                 break
         return variants, anchor_indices, required_entities
+
+    def match_prepared_questions(
+        self,
+        question: str,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Match one atomic query against retrieval-only question aliases.
+
+        Both the semantic question collection and the SQLite FTS question index
+        participate. Returned question text is routing metadata only; callers
+        must hydrate and cite the mapped source chunks as evidence.
+        """
+        bounded_limit = max(1, min(limit, 12))
+        matches: dict[str, dict[str, Any]] = {}
+
+        question_search = getattr(
+            self.vector_store,
+            "search_questions_many",
+            None,
+        )
+        if callable(question_search):
+            semantic_batches = question_search([question], bounded_limit)
+            semantic_results = semantic_batches[0] if semantic_batches else []
+            records = self.database.chunk_questions_by_ids(
+                [item["question_id"] for item in semantic_results]
+            )
+            for rank, item in enumerate(semantic_results, 1):
+                record = records.get(item["question_id"])
+                if not record:
+                    continue
+                matches[item["question_id"]] = {
+                    **record,
+                    "score": float(item.get("score", 0.0)),
+                    "rrf_score": 1.0 / (60 + rank),
+                    "match_sources": ["prepared_semantic"],
+                }
+
+        keyword_search = getattr(
+            self.database,
+            "search_chunk_questions",
+            None,
+        )
+        if callable(keyword_search):
+            for rank, item in enumerate(
+                keyword_search(question, bounded_limit),
+                1,
+            ):
+                question_id = item["question_id"]
+                candidate = matches.setdefault(
+                    question_id,
+                    {
+                        "question_id": question_id,
+                        "chunk_id": item["chunk_id"],
+                        "question": item["question"],
+                        "kind": item["kind"],
+                        "score": 0.0,
+                        "rrf_score": 0.0,
+                        "match_sources": [],
+                    },
+                )
+                candidate["score"] = max(
+                    float(candidate.get("score", 0.0)),
+                    float(item.get("score", 0.0)),
+                )
+                candidate["rrf_score"] += 1.0 / (60 + rank)
+                if "prepared_keyword" not in candidate["match_sources"]:
+                    candidate["match_sources"].append("prepared_keyword")
+
+        ordered = sorted(
+            matches.values(),
+            key=lambda item: (
+                item.get("rrf_score", 0.0),
+                len(item.get("match_sources", [])),
+                item.get("score", 0.0),
+            ),
+            reverse=True,
+        )
+        return ordered[:bounded_limit]
+
+    def match_prepared_questions_many(
+        self,
+        questions: list[str],
+        limit: int = 3,
+        semantic_batches: list[list[dict[str, Any]]] | None = None,
+    ) -> list[list[dict[str, Any]]]:
+        """Batch semantic alias matching while retaining an FTS lane per task."""
+        if not questions:
+            return []
+        bounded_limit = max(1, min(limit, 12))
+        question_search = getattr(
+            self.vector_store,
+            "search_questions_many",
+            None,
+        )
+        if semantic_batches is None:
+            semantic_batches = (
+                question_search(questions, bounded_limit)
+                if callable(question_search)
+                else [[] for _ in questions]
+            )
+        if len(semantic_batches) != len(questions):
+            raise ValueError(
+                "Prepared-question semantic batches must align with queries."
+            )
+        all_question_ids = list(
+            dict.fromkeys(
+                item["question_id"]
+                for batch in semantic_batches
+                for item in batch
+            )
+        )
+        records = self.database.chunk_questions_by_ids(all_question_ids)
+        keyword_search = getattr(
+            self.database,
+            "search_chunk_questions",
+            None,
+        )
+        keyword_search_many = getattr(
+            self.database,
+            "search_chunk_questions_many",
+            None,
+        )
+        keyword_batches = (
+            keyword_search_many(questions, bounded_limit)
+            if callable(keyword_search_many)
+            else [
+                (
+                    keyword_search(question, bounded_limit)
+                    if callable(keyword_search)
+                    else []
+                )
+                for question in questions
+            ]
+        )
+
+        batches: list[list[dict[str, Any]]] = []
+        for semantic_results, keyword_results in zip(
+            semantic_batches,
+            keyword_batches,
+        ):
+            matches: dict[str, dict[str, Any]] = {}
+            for rank, item in enumerate(semantic_results, 1):
+                record = records.get(item["question_id"])
+                if not record:
+                    continue
+                matches[item["question_id"]] = {
+                    **record,
+                    "score": float(item.get("score", 0.0)),
+                    "rrf_score": 1.0 / (60 + rank),
+                    "match_sources": ["prepared_semantic"],
+                }
+            for rank, item in enumerate(keyword_results, 1):
+                question_id = item["question_id"]
+                candidate = matches.setdefault(
+                    question_id,
+                    {
+                        "question_id": question_id,
+                        "chunk_id": item["chunk_id"],
+                        "question": item["question"],
+                        "kind": item["kind"],
+                        "score": 0.0,
+                        "rrf_score": 0.0,
+                        "match_sources": [],
+                    },
+                )
+                candidate["score"] = max(
+                    float(candidate.get("score", 0.0)),
+                    float(item.get("score", 0.0)),
+                )
+                candidate["rrf_score"] += 1.0 / (60 + rank)
+                if "prepared_keyword" not in candidate["match_sources"]:
+                    candidate["match_sources"].append("prepared_keyword")
+            ordered = sorted(
+                matches.values(),
+                key=lambda item: (
+                    item.get("rrf_score", 0.0),
+                    len(item.get("match_sources", [])),
+                    item.get("score", 0.0),
+                ),
+                reverse=True,
+            )
+            batches.append(ordered[:bounded_limit])
+        return batches
+
+    @staticmethod
+    def _atomic_terms(question: str) -> list[str]:
+        return _salient_tokens(question)
+
+    def _decorate_complete_section(
+        self,
+        chunks: list[dict[str, Any]],
+        routed_results: list[dict[str, Any]],
+        prepared_matches: list[dict[str, Any]],
+        question: str,
+    ) -> list[dict[str, Any]]:
+        if not chunks:
+            return []
+        best_score = max(
+            (float(item.get("score", 0.0)) for item in routed_results),
+            default=0.0,
+        )
+        by_chunk = {
+            item["chunk_id"]: item
+            for item in routed_results
+        }
+        by_page_section = {
+            (_canonical_page(item["page_url"]), _normalized_label(item["section"])): item
+            for item in routed_results
+        }
+        aggregate_sources = list(
+            dict.fromkeys(
+                source
+                for item in routed_results
+                for source in item.get("retrieval_sources", [])
+            )
+        )
+        route_hints = list(
+            dict.fromkeys(
+                str(item["question"])
+                for item in prepared_matches
+                if item.get("question")
+            )
+        )[:5]
+        terms = self._atomic_terms(question)
+        decorated: list[dict[str, Any]] = []
+        for chunk in chunks:
+            routed = by_chunk.get(chunk["chunk_id"]) or by_page_section.get(
+                (
+                    _canonical_page(chunk["page_url"]),
+                    _normalized_label(chunk["section"]),
+                )
+            )
+            sources = list(
+                dict.fromkeys(
+                    (
+                        *(
+                            (routed or {}).get("retrieval_sources", [])
+                            or aggregate_sources
+                        ),
+                        "complete_team_section",
+                    )
+                )
+            )
+            hints = list(
+                dict.fromkeys(
+                    (
+                        *((routed or {}).get("matched_expected_questions", [])),
+                        *route_hints,
+                    )
+                )
+            )[:5]
+            searchable = (
+                f"{chunk['title']} {chunk['section']} {chunk['text']}"
+            ).lower()
+            decorated.append({
+                **chunk,
+                "score": float((routed or {}).get("score", best_score)),
+                "retrieval_sources": sources,
+                "matched_terms": [
+                    term for term in terms if _stem(term) in searchable
+                ],
+                "matched_expected_questions": hints,
+            })
+        return decorated
+
+    def _rank_atomic_lanes(
+        self,
+        question: str,
+        variants: list[str],
+        lanes: list[tuple[str, list[dict[str, Any]], float]],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        fused = self._fuse(lanes)
+        if not fused:
+            return []
+        original_tokens = _salient_tokens(question)
+        original_stems = {_stem(token) for token in original_tokens}
+        variant_stems = {
+            _stem(token)
+            for variant in variants[1:]
+            for token in _salient_tokens(variant)
+        }
+        max_rrf = max(item["rrf_score"] for item in fused)
+        for item in fused:
+            searchable = f"{item['title']} {item['section']} {item['text']}"
+            searchable_stems = {
+                _stem(token)
+                for token in re.findall(r"[A-Za-z0-9]+", searchable.lower())
+            }
+            matched_original = original_stems & searchable_stems
+            matched_variants = variant_stems & searchable_stems
+            original_coverage = len(matched_original) / max(1, len(original_stems))
+            variant_coverage = len(matched_variants) / max(1, len(variant_stems))
+            sources = set(item["retrieval_sources"])
+            cross_channel = bool(
+                any(source.startswith("semantic_") for source in sources)
+                and any(source.startswith("keyword_") for source in sources)
+            )
+            item["original_coverage"] = original_coverage
+            item["matched_terms"] = sorted(
+                token for token in original_tokens if _stem(token) in matched_original
+            )
+            item["score"] = max(
+                0.0,
+                (0.33 * item.get("semantic_score", 0.0))
+                + (0.15 * item.get("question_score", 0.0))
+                + (0.08 * item.get("keyword_score", 0.0))
+                + (0.05 * item.get("question_keyword_score", 0.0))
+                + (0.18 * original_coverage)
+                + (0.08 * variant_coverage)
+                + (0.08 if cross_channel else 0.0)
+                + (0.05 * (item["rrf_score"] / max_rrf)),
+            )
+            item["evidence_text"] = self._evidence_window(
+                item["text"],
+                original_stems | variant_stems,
+            )
+
+        if self.config.enable_reranker:
+            logits = self._cross_encoder().predict(
+                [(question, item["evidence_text"]) for item in fused],
+                show_progress_bar=False,
+            )
+            for item, logit in zip(fused, logits):
+                item["rerank_score"] = float(logit)
+            fused.sort(
+                key=lambda item: (item["rerank_score"], item["score"]),
+                reverse=True,
+            )
+        else:
+            fused.sort(
+                key=lambda item: (item["score"], item["rrf_score"]),
+                reverse=True,
+            )
+
+        selected: list[dict[str, Any]] = []
+        selected_ids: set[str] = set()
+        page_counts: dict[str, int] = {}
+        for page_limit in (1, 2):
+            for item in fused:
+                if item["chunk_id"] in selected_ids:
+                    continue
+                page_key = _canonical_page(item["page_url"])
+                if page_counts.get(page_key, 0) >= page_limit:
+                    continue
+                selected.append(item)
+                selected_ids.add(item["chunk_id"])
+                page_counts[page_key] = page_counts.get(page_key, 0) + 1
+                if len(selected) >= limit:
+                    break
+            if len(selected) >= limit:
+                break
+        for item in selected:
+            if "evidence_text" in item:
+                item["text"] = item.pop("evidence_text")
+        return selected
+
+    def _finalize_atomic_bundle(
+        self,
+        task: dict[str, Any],
+        prepared_matches: list[dict[str, Any]],
+        routed_results: list[dict[str, Any]],
+        retrieval_channels: list[str] | None = None,
+    ) -> dict[str, Any]:
+        normalized_question = " ".join(str(task["question"]).split())
+        normalized_facet = (
+            _normalized_label(str(task.get("facet", "general"))).replace(" ", "_")
+            or "general"
+        )
+        team_name = " ".join(str(task.get("team_name", "")).split())
+        requires_complete_section = bool(
+            task.get("requires_complete_section")
+        )
+        requires_complete_population = bool(
+            task.get("requires_complete_population")
+        )
+        evidence = routed_results
+
+        if normalized_facet == "team_list" and requires_complete_section:
+            directory_lookup = getattr(
+                self.database,
+                "team_directory_chunks",
+                None,
+            )
+            directory_chunks = (
+                directory_lookup()
+                if callable(directory_lookup)
+                else []
+            )
+            if directory_chunks:
+                evidence = self._decorate_complete_section(
+                    directory_chunks,
+                    routed_results,
+                    prepared_matches,
+                    normalized_question,
+                )
+            else:
+                evidence = []
+
+        team_pages: list[dict[str, Any]] = []
+        find_team_pages = getattr(self.database, "find_team_pages", None)
+        if team_name and callable(find_team_pages):
+            team_pages = find_team_pages(team_name, limit=3)
+        team_page_urls = {
+            _canonical_page(item["page_url"])
+            for item in team_pages
+            if item.get("page_url")
+        }
+        team_ids = {
+            str(item.get("team_id", "")).strip()
+            for item in team_pages
+            if str(item.get("team_id", "")).strip()
+        }
+        team_slugs = {
+            _normalized_label(str(item.get("slug", "")))
+            for item in team_pages
+            if _normalized_label(str(item.get("slug", "")))
+        }
+        team_names = {
+            _normalized_label(str(item.get("team_name", "")))
+            for item in team_pages
+            if _normalized_label(str(item.get("team_name", "")))
+        }
+
+        section_lookup = getattr(
+            self.database,
+            "team_section_chunks",
+            None,
+        )
+        expanded_complete_section = False
+        if team_name and not team_pages:
+            # Team-specific evidence must fail closed when a planner entity
+            # cannot be resolved to an indexed source page.
+            evidence = []
+        if (
+            team_name
+            and team_pages
+            and callable(section_lookup)
+            and normalized_facet in FACET_SECTION_ALIASES
+        ):
+            complete_chunks: list[dict[str, Any]] = []
+            for section_alias in FACET_SECTION_ALIASES[normalized_facet]:
+                complete_chunks = section_lookup(
+                    team_name,
+                    section_alias,
+                    page_limit=1,
+                    chunk_limit=None,
+                )
+                if complete_chunks:
+                    break
+            if complete_chunks:
+                evidence = self._decorate_complete_section(
+                    complete_chunks,
+                    routed_results,
+                    prepared_matches,
+                    normalized_question,
+                )
+                expanded_complete_section = True
+            elif normalized_facet == "captain":
+                captain_lookup = getattr(
+                    self.database,
+                    "captain_candidate_chunks",
+                    None,
+                )
+                captain_candidates = (
+                    captain_lookup(team_name)
+                    if callable(captain_lookup)
+                    else []
+                )
+                named_candidates = [
+                    item
+                    for item in captain_candidates
+                    if _contains_named_captain_evidence(
+                        f"{item['section']}\n{item['text']}"
+                    )
+                ]
+                evidence = self._decorate_complete_section(
+                    named_candidates,
+                    routed_results,
+                    prepared_matches,
+                    normalized_question,
+                )
+            elif requires_complete_section:
+                evidence = []
+
+        if team_page_urls and normalized_facet not in {"roster", "captain"}:
+            team_specific = [
+                item
+                for item in evidence
+                if (
+                    _canonical_page(item["page_url"]) in team_page_urls
+                    or _team_path_id(item["page_url"]) in team_ids
+                    or any(
+                        f" {slug} "
+                        in (
+                            f" {_normalized_label(urlparse(item['page_url']).path)} "
+                        )
+                        for slug in team_slugs
+                    )
+                    or any(
+                        f" {name} "
+                        in (
+                            " "
+                            + _normalized_label(
+                                " ".join(
+                                    (
+                                        str(item.get("title", "")),
+                                        str(item.get("section", "")),
+                                        str(item.get("text", "")),
+                                    )
+                                )
+                            )
+                            + " "
+                        )
+                        for name in team_names
+                    )
+                )
+            ]
+            if team_specific or normalized_facet == "captain":
+                evidence = team_specific
+
+        if (
+            requires_complete_section
+            and evidence
+            and not expanded_complete_section
+            and normalized_facet != "team_list"
+        ):
+            section_chunks = getattr(self.database, "section_chunks", None)
+            if callable(section_chunks):
+                anchor = evidence[0]
+                try:
+                    complete_chunks = section_chunks(
+                        anchor["page_url"],
+                        anchor["section"],
+                        limit=None,
+                    )
+                except TypeError:
+                    complete_chunks = section_chunks(
+                        anchor["page_url"],
+                        anchor["section"],
+                        limit=64,
+                    )
+                if complete_chunks:
+                    evidence = self._decorate_complete_section(
+                        complete_chunks,
+                        routed_results,
+                        prepared_matches,
+                        normalized_question,
+                    )
+                    expanded_complete_section = True
+
+        # A complete page section is not the same as a complete league-wide
+        # population. Exact counts, rankings and extrema must stay partial
+        # until a deterministic population/metric verifier explicitly marks
+        # the task as covered.
+        population_coverage_verified = bool(
+            task.get("population_coverage_verified")
+        )
+        is_complete = (
+            bool(evidence)
+            and (
+                not requires_complete_section
+                or expanded_complete_section
+                or normalized_facet == "team_list"
+            )
+            and (
+                not requires_complete_population
+                or population_coverage_verified
+            )
+        )
+        if not evidence:
+            status = "missing"
+            missing_reason = "No qualified original source chunks were retrieved."
+        elif requires_complete_population and not is_complete:
+            status = "partial"
+            missing_reason = (
+                "Complete population and metric coverage was not verified."
+            )
+        elif requires_complete_section and not is_complete:
+            status = "partial"
+            missing_reason = "A complete source section was not available."
+        elif is_complete and requires_complete_section:
+            status = "complete"
+            missing_reason = ""
+        else:
+            status = "found"
+            missing_reason = ""
+        return {
+            **task,
+            "question": normalized_question,
+            "facet": normalized_facet,
+            "team_name": team_name,
+            "matched_questions": prepared_matches,
+            "retrieval_channels": list(retrieval_channels or []),
+            "evidence": evidence,
+            "complete": is_complete,
+            "status": status,
+            "evidence_count": len(evidence),
+            "missing_reason": missing_reason,
+        }
+
+    def search_atomic_many(
+        self,
+        tasks: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Retrieve every atomic task and its rewrites through all four lanes.
+
+        Planner rewrites first match the prepared-question semantic/keyword
+        indexes. Those aliases only route back to original chunks. The same
+        rewrites also search the original source semantic/keyword indexes.
+        """
+        if not tasks:
+            return []
+        normalized_tasks = [
+            {
+                **task,
+                "question": " ".join(str(task["question"]).split()),
+                "facet": (
+                    _normalized_label(str(task.get("facet", "general")))
+                    .replace(" ", "_")
+                    or "general"
+                ),
+                "team_name": " ".join(
+                    str(task.get("team_name", "")).split()
+                ),
+                "search_queries": [
+                    " ".join(str(item).split())[:240]
+                    for item in (
+                        task.get("search_queries", [])
+                        if isinstance(task.get("search_queries", []), list)
+                        else []
+                    )
+                    if " ".join(str(item).split())
+                ][:4],
+            }
+            for task in tasks
+        ]
+
+        base_variants_by_task: list[list[str]] = []
+        flattened_base_variants: list[str] = []
+        base_variant_ranges: list[tuple[int, int]] = []
+        for task in normalized_tasks:
+            variants = [task["question"]]
+            for query in task["search_queries"]:
+                if query.lower() not in {item.lower() for item in variants}:
+                    variants.append(query)
+            expanded = expand_query(task["question"])
+            if expanded.lower() not in {item.lower() for item in variants}:
+                variants.append(expanded)
+            if int(task.get("atomic_task_count", 1)) == 1:
+                original_question = " ".join(
+                    str(task.get("original_question", "")).split()
+                )[:300]
+                if (
+                    original_question
+                    and original_question.lower()
+                    not in {item.lower() for item in variants}
+                ):
+                    variants.append(original_question)
+            keyword_query = " ".join(
+                str(item).strip()
+                for item in task.get("keywords", [])[:8]
+                if str(item).strip()
+            )[:240]
+            if (
+                keyword_query
+                and keyword_query.lower()
+                not in {item.lower() for item in variants}
+            ):
+                variants.append(keyword_query)
+            variants = variants[:6]
+            start = len(flattened_base_variants)
+            flattened_base_variants.extend(variants)
+            base_variant_ranges.append(
+                (start, len(flattened_base_variants))
+            )
+            base_variants_by_task.append(variants)
+
+        combined_vector_search = getattr(
+            self.vector_store,
+            "search_source_and_questions_many",
+            None,
+        )
+        base_source_semantic_flat: list[list[dict[str, Any]]] | None = None
+        prepared_semantic_flat: list[list[dict[str, Any]]] | None = None
+        if callable(combined_vector_search):
+            (
+                base_source_semantic_flat,
+                prepared_semantic_flat,
+            ) = combined_vector_search(
+                flattened_base_variants,
+                self.config.semantic_top_k,
+                3,
+            )
+        prepared_variant_batches = self.match_prepared_questions_many(
+            flattened_base_variants,
+            limit=3,
+            semantic_batches=prepared_semantic_flat,
+        )
+
+        prepared_batches: list[list[dict[str, Any]]] = []
+        for start, end in base_variant_ranges:
+            merged: dict[str, dict[str, Any]] = {}
+            for variant_index, matches in enumerate(
+                prepared_variant_batches[start:end]
+            ):
+                variant_weight = 1.0 if variant_index == 0 else 0.82
+                query_variant = flattened_base_variants[
+                    start + variant_index
+                ]
+                for rank, match in enumerate(matches, 1):
+                    question_id = str(match["question_id"])
+                    candidate = merged.setdefault(
+                        question_id,
+                        {
+                            **match,
+                            "rrf_score": 0.0,
+                            "match_sources": [],
+                            "matched_query_variants": [],
+                        },
+                    )
+                    candidate["score"] = max(
+                        float(candidate.get("score", 0.0)),
+                        float(match.get("score", 0.0)),
+                    )
+                    candidate["rrf_score"] += (
+                        variant_weight / (60 + rank)
+                    )
+                    candidate["match_sources"] = list(
+                        dict.fromkeys(
+                            (
+                                *candidate.get("match_sources", []),
+                                *match.get("match_sources", []),
+                            )
+                        )
+                    )
+                    if (
+                        query_variant
+                        not in candidate["matched_query_variants"]
+                    ):
+                        candidate["matched_query_variants"].append(
+                            query_variant
+                        )
+            prepared_batches.append(
+                sorted(
+                    merged.values(),
+                    key=lambda item: (
+                        item.get("rrf_score", 0.0),
+                        len(item.get("match_sources", [])),
+                        item.get("score", 0.0),
+                    ),
+                    reverse=True,
+                )[:5]
+            )
+
+        source_variants_by_task: list[list[str]] = []
+        flattened_variants: list[str] = []
+        variant_ranges: list[tuple[int, int]] = []
+        prepared_alias_starts: list[int] = []
+        for base_variants, prepared_matches in zip(
+            base_variants_by_task,
+            prepared_batches,
+        ):
+            variants = list(base_variants)
+            prepared_alias_starts.append(len(variants))
+            for match in prepared_matches[:2]:
+                route_query = " ".join(str(match["question"]).split())[:300]
+                if (
+                    route_query
+                    and route_query.lower()
+                    not in {item.lower() for item in variants}
+                ):
+                    variants.append(route_query)
+            start = len(flattened_variants)
+            flattened_variants.extend(variants)
+            variant_ranges.append((start, len(flattened_variants)))
+            source_variants_by_task.append(variants)
+
+        if base_source_semantic_flat is None:
+            semantic_flat = self.vector_store.search_many(
+                flattened_variants,
+                self.config.semantic_top_k,
+            )
+        else:
+            flattened_aliases: list[str] = []
+            alias_ranges: list[tuple[int, int]] = []
+            for base_variants, source_variants in zip(
+                base_variants_by_task,
+                source_variants_by_task,
+            ):
+                start = len(flattened_aliases)
+                flattened_aliases.extend(
+                    source_variants[len(base_variants):]
+                )
+                alias_ranges.append((start, len(flattened_aliases)))
+            alias_semantic_flat = (
+                self.vector_store.search_many(
+                    flattened_aliases,
+                    self.config.semantic_top_k,
+                )
+                if flattened_aliases
+                else []
+            )
+            semantic_flat = []
+            for (
+                (base_start, base_end),
+                (alias_start, alias_end),
+            ) in zip(base_variant_ranges, alias_ranges):
+                semantic_flat.extend(
+                    base_source_semantic_flat[base_start:base_end]
+                )
+                semantic_flat.extend(
+                    alias_semantic_flat[alias_start:alias_end]
+                )
+        prepared_chunk_ids = list(
+            dict.fromkeys(
+                match["chunk_id"]
+                for batch in prepared_batches
+                for match in batch
+            )
+        )
+        prepared_chunks = {
+            item["chunk_id"]: item
+            for item in self.database.chunks_by_ids(prepared_chunk_ids)
+        }
+        source_keyword_many = getattr(self.database, "search_many", None)
+        if callable(source_keyword_many):
+            exact_keyword_batches = source_keyword_many(
+                [task["question"] for task in normalized_tasks],
+                self.config.keyword_top_k,
+                match_mode="all",
+            )
+            broad_keyword_flat = source_keyword_many(
+                flattened_variants,
+                self.config.keyword_top_k,
+                match_mode="any",
+            )
+        else:
+            exact_keyword_batches = [
+                self.database.search(
+                    task["question"],
+                    self.config.keyword_top_k,
+                    match_mode="all",
+                )
+                for task in normalized_tasks
+            ]
+            broad_keyword_flat = [
+                self.database.search(
+                    query,
+                    self.config.keyword_top_k,
+                    match_mode="any",
+                )
+                for query in flattened_variants
+            ]
+
+        results: list[dict[str, Any]] = []
+        for task_index, task in enumerate(normalized_tasks):
+            variants = source_variants_by_task[task_index]
+            base_variants = base_variants_by_task[task_index]
+            prepared_alias_start = prepared_alias_starts[task_index]
+            start, end = variant_ranges[task_index]
+            semantic_batches = semantic_flat[start:end]
+            prepared_matches = prepared_batches[task_index]
+            lanes: list[tuple[str, list[dict[str, Any]], float]] = []
+            for variant_index, semantic_results in enumerate(semantic_batches):
+                weight = (
+                    1.0
+                    if variant_index == 0
+                    else 0.84
+                    if variant_index < prepared_alias_start
+                    else 0.72
+                )
+                lanes.append(
+                    (
+                        f"semantic_{variant_index}",
+                        semantic_results,
+                        weight,
+                    )
+                )
+
+            for match_index, match in enumerate(prepared_matches):
+                source_chunk = prepared_chunks.get(match["chunk_id"])
+                if not source_chunk:
+                    continue
+                resolved = [{
+                    **source_chunk,
+                    "score": float(match.get("score", 0.0)),
+                    "matched_expected_question": match["question"],
+                }]
+                match_sources = set(match.get("match_sources", []))
+                if "prepared_semantic" in match_sources:
+                    lanes.append(
+                        (
+                            f"question_semantic_{match_index}",
+                            resolved,
+                            0.82,
+                        )
+                    )
+                if "prepared_keyword" in match_sources:
+                    lanes.append(
+                        (
+                            f"question_keyword_{match_index}",
+                            resolved,
+                            0.72,
+                        )
+                    )
+
+            exact = exact_keyword_batches[task_index]
+            if exact:
+                lanes.append(("keyword_exact", exact, 1.25))
+            broad_batches = broad_keyword_flat[start:end]
+            broad = broad_batches[0] if broad_batches else []
+            if broad:
+                lanes.append(("keyword_original", broad, 1.0))
+            for variant_index, keyword_results in enumerate(
+                broad_batches[1:],
+                1,
+            ):
+                if keyword_results:
+                    lanes.append(
+                        (
+                            f"keyword_variant_{variant_index}",
+                            keyword_results,
+                            (
+                                0.78
+                                if variant_index < prepared_alias_start
+                                else 0.62
+                            ),
+                        )
+                    )
+
+            routed_results = self._rank_atomic_lanes(
+                task["question"],
+                variants,
+                lanes,
+                max(
+                    1,
+                    int(
+                        task.get(
+                            "result_limit",
+                            self.config.composite_task_top_k,
+                        )
+                    ),
+                ),
+            )
+            qualified_results = [
+                item
+                for item in routed_results
+                if float(item.get("score", 0.0))
+                >= self.config.min_retrieval_score
+            ]
+            results.append(
+                self._finalize_atomic_bundle(
+                    {
+                        **task,
+                        "query_variants": base_variants,
+                    },
+                    prepared_matches,
+                    qualified_results,
+                    [
+                        lane_name
+                        for lane_name, lane_results, _weight in lanes
+                        if lane_results
+                    ],
+                )
+            )
+        return results
+
+    def search_atomic(
+        self,
+        question: str,
+        *,
+        facet: str = "general",
+        team_name: str = "",
+        result_limit: int | None = None,
+        requires_complete_section: bool = False,
+        search_queries: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Retrieve one decomposed task through all hybrid routing lanes."""
+        return self.search_atomic_many([{
+            "question": question,
+            "facet": facet,
+            "team_name": team_name,
+            "search_queries": list(search_queries or []),
+            "result_limit": (
+                result_limit or self.config.retrieval_top_k
+            ),
+            "requires_complete_section": requires_complete_section,
+        }])[0]
 
     def search(
         self,
@@ -633,7 +1670,10 @@ class HybridRetriever:
         selected_ids: set[str] = set()
 
         if complete_sections:
-            requested_groups = max(1, min(group_count, 4))
+            requested_groups = max(
+                1,
+                min(group_count, self.config.max_composite_groups),
+            )
             section_groups: dict[str, list[dict[str, Any]]] = {}
             for item in fused:
                 section_key = re.sub(
@@ -703,7 +1743,8 @@ class HybridRetriever:
                     selected.append(item)
                     selected_ids.add(item["chunk_id"])
             if selected:
-                return selected[: max(limit, min(16, len(selected)))]
+                complete_limit = max(limit, requested_groups * 8)
+                return selected[:complete_limit]
 
         page_counts: dict[str, int] = {}
         # Preserve the best real source hit for each focused/planned query.

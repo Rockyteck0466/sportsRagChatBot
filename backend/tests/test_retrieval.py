@@ -335,3 +335,102 @@ def test_index_derived_title_alias_anchors_acronym_query() -> None:
     )
 
     assert results[0]["chunk_id"] == "towns-profile"
+
+
+def test_complete_page_section_does_not_prove_complete_population() -> None:
+    standings_chunk = {
+        "chunk_id": "standings-one-page",
+        "text": "Example Team 50 wins 32 losses",
+        "page_url": "https://www.nba.com/standings",
+        "title": "NBA Standings",
+        "section": "Standings",
+        "retrieved_at": "2026-01-01T00:00:00Z",
+        "score": 0.92,
+    }
+
+    class FakeDatabase:
+        def section_chunks(
+            self,
+            page_url: str,
+            section: str,
+            limit: int | None = None,
+        ) -> list[dict]:
+            return [dict(standings_chunk)]
+
+    retriever = HybridRetriever(
+        vector_store=None,  # type: ignore[arg-type]
+        database=FakeDatabase(),  # type: ignore[arg-type]
+        config=Settings(),
+    )
+
+    bundle = retriever._finalize_atomic_bundle(
+        {
+            "task_id": "wins-leader",
+            "question": "Which team won the most games?",
+            "facet": "standings",
+            "team_name": "",
+            "operation": "argmax",
+            "requires_complete_section": True,
+            "requires_complete_population": True,
+        },
+        [],
+        [dict(standings_chunk)],
+    )
+
+    assert bundle["evidence"]
+    assert bundle["complete"] is False
+    assert bundle["status"] == "partial"
+    assert "population" in bundle["missing_reason"].lower()
+
+
+def test_team_scoped_nested_schedule_page_is_not_discarded() -> None:
+    schedule_chunk = {
+        "chunk_id": "celtics-schedule",
+        "text": "Boston Celtics schedule and game results.",
+        "page_url": (
+            "https://www.nba.com/team/1610612738/celtics/schedule"
+        ),
+        "title": "Boston Celtics Schedule",
+        "section": "Schedule",
+        "retrieved_at": "2026-01-01T00:00:00Z",
+        "score": 0.91,
+    }
+
+    class FakeDatabase:
+        def find_team_pages(
+            self,
+            team_query: str,
+            limit: int | None = 3,
+        ) -> list[dict]:
+            return [{
+                "team_name": "Boston Celtics",
+                "team_id": "1610612738",
+                "page_url": "https://www.nba.com/team/1610612738/celtics",
+                "title": "Boston Celtics team profile",
+                "slug": "celtics",
+                "match_score": 500.0,
+            }]
+
+    retriever = HybridRetriever(
+        vector_store=None,  # type: ignore[arg-type]
+        database=FakeDatabase(),  # type: ignore[arg-type]
+        config=Settings(),
+    )
+
+    bundle = retriever._finalize_atomic_bundle(
+        {
+            "task_id": "celtics-schedule",
+            "question": "What is the Boston Celtics schedule?",
+            "facet": "schedule",
+            "team_name": "Boston Celtics",
+            "requires_complete_section": False,
+            "requires_complete_population": False,
+        },
+        [],
+        [dict(schedule_chunk)],
+    )
+
+    assert bundle["status"] == "found"
+    assert [item["chunk_id"] for item in bundle["evidence"]] == [
+        "celtics-schedule"
+    ]

@@ -40,7 +40,7 @@ def test_explicit_multi_group_count_is_detected() -> None:
     assert RagService._explicit_group_count("List any three rosters") == 3
 
 
-def test_plan_is_limited_to_queries_and_four_groups() -> None:
+def test_plan_is_limited_to_queries_and_thirty_groups() -> None:
     plan = RagService._validated_plan(
         {
             "search_queries": [
@@ -55,11 +55,11 @@ def test_plan_is_limited_to_queries_and_four_groups() -> None:
         "List teams and members",
     )
     assert plan["search_queries"] == ["team roster players", "NBA roster by team"]
-    assert plan["requested_groups"] == 4
+    assert plan["requested_groups"] == 30
     assert plan["requires_complete_sections"] is True
 
 
-def test_weak_or_complex_retrieval_uses_query_planner() -> None:
+def test_every_question_uses_query_planner_when_enabled() -> None:
     service = RagService(
         retriever=None,  # type: ignore[arg-type]
         config=Settings(
@@ -71,7 +71,7 @@ def test_weak_or_complex_retrieval_uses_query_planner() -> None:
         "score": 0.7,
         "retrieval_sources": ["semantic_0", "keyword_original"],
     }]
-    assert service._needs_query_plan("How many divisions are there?", retrieved) is False
+    assert service._needs_query_plan("How many divisions are there?", retrieved) is True
     assert service._needs_query_plan(
         "List players for at least two teams", retrieved
     ) is True
@@ -112,6 +112,8 @@ def test_answer_prompt_treats_matched_question_as_non_evidence() -> None:
             self,
             system_prompt: str,
             user_prompt: str,
+            *,
+            max_output_tokens: int | None = None,
         ) -> dict:
             self.prompts = (system_prompt, user_prompt)
             return {
@@ -129,7 +131,7 @@ def test_answer_prompt_treats_matched_question_as_non_evidence() -> None:
     assert response.refused is False
     assert service.prompts is not None
     system_prompt, user_prompt = service.prompts
-    assert "Question: How large can a team be?" in user_prompt
+    assert "Original question:\nHow large can a team be?" in user_prompt
     assert "Matched expected-question retrieval hints (NOT EVIDENCE)" in user_prompt
     assert "What is the maximum NBA roster size?" in user_prompt
     assert "Content: Each team may have up to 15 players on its roster." in user_prompt
